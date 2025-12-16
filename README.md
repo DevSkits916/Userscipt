@@ -1,6 +1,6 @@
 
 # Facebook Groups Scraper Userscript
-
+(Violates Facebook TOS but works and they cant tell)
 A userscript that scans Facebook group pages and exports group data to CSV so you can stop manually copying URLs like it’s 2009.
 
 Designed for bulk group collection, filtering, and later automation workflows.
