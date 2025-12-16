@@ -1,10 +1,3 @@
-████████╗ ██████╗ ██╗  ██╗███████╗███╗   ██╗███████╗    ███╗   ██╗    ████████╗ ██████╗ ██╗  ██╗██╗███╗   ██╗
-╚══██╔══╝██╔═══██╗██║ ██╔╝██╔════╝████╗  ██║██╔════╝    ████╗  ██║    ╚══██╔══╝██╔═══██╗██║ ██╔╝██║████╗  ██║
-   ██║   ██║   ██║█████╔╝ █████╗  ██╔██╗ ██║███████╗    ██╔██╗ ██║       ██║   ██║   ██║█████╔╝ ██║██╔██╗ ██║
-   ██║   ██║   ██║██╔═██╗ ██╔══╝  ██║╚██╗██║╚════██║    ██║╚██╗██║       ██║   ██║   ██║██╔═██╗ ██║██║╚██╗██║
-   ██║   ╚██████╔╝██║  ██╗███████╗██║ ╚████║███████║    ██║ ╚████║       ██║   ╚██████╔╝██║  ██╗██║██║ ╚████║
-   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚══════╝    ╚═╝  ╚═══╝       ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝
-
 
 # Facebook Groups Scraper Userscript
 
@@ -19,6 +12,7 @@ Designed for bulk group collection, filtering, and later automation workflows.
 - Exports results to a CSV file
 - Removes repetitive, manual work from group discovery
 - Plays nicely with downstream automation tools
+such as https://paste-tmko.onrender.com
 
 If you deal with Facebook groups at scale, this saves time and wrist cartilage.
 
