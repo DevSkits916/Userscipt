@@ -1,4 +1,4 @@
-use chatgpt after you export a csv to add a collum for post for each group and see pastehappy
+IOS 26.2 friendly (user userscipts or stay from app store)
 # Facebook Groups Scraper Userscript
 (Violates Facebook TOS but works and they cant tell)
 A userscript that scans Facebook group pages and exports group data to CSV so you can stop manually copying URLs like it’s 2009.
