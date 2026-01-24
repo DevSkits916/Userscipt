@@ -1,4 +1,6 @@
 IOS 26.2 friendly (user userscipts or stay from app store)
+https://github.com/DevSkits916/Userscipt/blob/main/Exported%20csv.png
+
 # Facebook Groups Scraper Userscript
 (Violates Facebook TOS but works and they cant tell)
 A userscript that scans Facebook group pages and exports group data to CSV so you can stop manually copying URLs like it’s 2009.
