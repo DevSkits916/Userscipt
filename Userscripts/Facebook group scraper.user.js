@@ -1,805 +1,433 @@
 // ==UserScript==
-// @name         Facebook Groups → CSV/JSON Exporter (Enhanced v3.1 UI Fix)
-// @namespace    devskits916.fb.groups.csv
-// @version      3.1.1
-// @description  Advanced Facebook group discovery scraper with modern UI + FIXED panel markup/IDs (was broken), draggable/resizable panel, theme toggle, progress, filters, robust scanning, 2025 layout compatibility.
-// @author       Calder
-// @match        https://www.facebook.com/*groups*
-// @match        https://m.facebook.com/*groups*
-// @grant        GM_setClipboard
-// @grant        GM_addStyle
+// @name         FB Groups Joins Scanner -> CSV Export
+// @namespace    devskits916
+// @version      1.0.0
+// @description  Continuously scans Facebook /groups/joins list, collects group name + URL, exports to CSV.
+// @match        https://www.facebook.com/groups/joins/*
+// @match        https://www.facebook.com/groups/joins/?*
 // @run-at       document-idle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
 // ==/UserScript==
 
-(function () {
-  'use strict';
+(() => {
+  "use strict";
 
-  // --------- State ---------
-  const state = {
-    items: new Map(), // key: groupKey, value: record
-    autoscanTimer: null,
-    autoscanEndAt: 0,
-    isScanning: false,
-    theme: 'dark',
-    panelMinimized: false,
-    settings: {
-      autoStart: false,
-      maxItems: 5000,
-      exportFormat: 'csv',
-      showProgress: true,
-      showList: false,
-      minMembers: 0,
-      activityThreshold: '' // e.g. "1 day"
+  /***********************
+   * CONFIG
+   ***********************/
+  const STORE_KEY = "DEVSKITS_FB_GROUP_SCANNER_DATA_V1";
+  const SCAN_INTERVAL_MS = 1500;      // how often we scan DOM for groups
+  const SCROLL_INTERVAL_MS = 2500;    // how often we scroll down
+  const SCROLL_STEP = 900;            // pixels per scroll tick
+  const MAX_NAME_LEN = 180;
+
+  /***********************
+   * UTIL
+   ***********************/
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function sanitizeName(name) {
+    if (!name) return "";
+    return String(name)
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, MAX_NAME_LEN);
+  }
+
+  function normalizeGroupUrl(url) {
+    if (!url) return "";
+    try {
+      const u = new URL(url, location.origin);
+      // Strip FB tracking params
+      u.searchParams.delete("__cft__");
+      u.searchParams.delete("__tn__");
+      u.searchParams.delete("ref");
+      u.searchParams.delete("source");
+      u.searchParams.delete("nav_source");
+      u.searchParams.delete("epa");
+      u.searchParams.delete("mibextid");
+      // Normalize to canonical groups path
+      // e.g. https://www.facebook.com/groups/123456789/
+      // Keep pathname only, ensure trailing slash
+      let path = u.pathname;
+      // Sometimes links are like /groups/ID/?ref=...; keep /groups/ID/
+      const m = path.match(/\/groups\/[^\/?#]+/i);
+      if (m) path = m[0] + "/";
+      return `${u.origin}${path}`;
+    } catch {
+      return url;
     }
-  };
-
-  // --------- Storage ---------
-  function loadSettings() {
-    try {
-      const saved = localStorage.getItem('fb-groups-scraper-settings-v3');
-      if (saved) Object.assign(state.settings, JSON.parse(saved));
-    } catch (e) { console.error('Load settings error:', e); }
   }
 
-  function saveSettings() {
-    try {
-      localStorage.setItem('fb-groups-scraper-settings-v3', JSON.stringify(state.settings));
-    } catch (e) { console.error('Save settings error:', e); }
+  function csvEscape(value) {
+    const s = String(value ?? "");
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
   }
 
-  // --------- UI Creation (FIXED) ---------
-  function createPanel() {
-    const panel = document.createElement('div');
-    panel.id = 'fb-groups-scraper-panel';
+  function toCsv(rows) {
+    const header = ["name", "url", "firstSeen"];
+    const lines = [header.join(",")];
+    for (const r of rows) {
+      lines.push([csvEscape(r.name), csvEscape(r.url), csvEscape(r.firstSeen)].join(","));
+    }
+    return lines.join("\n");
+  }
 
-    // NOTE: The previous script’s UI was “broken” because it injected a bunch of raw text
-    // without the IDs/classes your CSS + event hooks expect. Humans: undefeated at mismatch bugs.
-    panel.innerHTML = `
-      <div id="fb-groups-scraper-header">
-        <div class="title">
-          <span aria-hidden="true">📊</span>
-          <span>Groups Exporter</span>
-          <span class="pill" title="Collected groups">
-            <span id="fb-groups-scraper-count">0</span>
-          </span>
-        </div>
-        <div class="controls">
-          <button id="fb-groups-scraper-theme" title="Toggle theme" type="button">🌙</button>
-          <button id="fb-groups-scraper-minimize" title="Minimize" type="button">▁</button>
-          <button id="fb-groups-scraper-close" title="Close" type="button">✕</button>
-        </div>
+  function downloadText(filename, text, mime = "text/csv;charset=utf-8") {
+    const blob = new Blob([text], { type: mime });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 1000);
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // iOS Safari is moody. Fallback to a temporary textarea + selection.
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        ta.style.top = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return !!ok;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  function loadStore() {
+    try {
+      const raw = GM_getValue(STORE_KEY, "");
+      if (!raw) return { byUrl: {}, order: [] };
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return { byUrl: {}, order: [] };
+      if (!parsed.byUrl) parsed.byUrl = {};
+      if (!parsed.order) parsed.order = [];
+      return parsed;
+    } catch {
+      return { byUrl: {}, order: [] };
+    }
+  }
+
+  function saveStore(store) {
+    GM_setValue(STORE_KEY, JSON.stringify(store));
+  }
+
+  /***********************
+   * FIND GROUP LINKS
+   ***********************/
+  function extractGroupCandidates() {
+    // We look for anchors linking to /groups/...
+    const anchors = Array.from(document.querySelectorAll('a[href*="/groups/"]'));
+    const results = [];
+
+    for (const a of anchors) {
+      const href = a.getAttribute("href") || "";
+      if (!href.includes("/groups/")) continue;
+
+      // Exclude obviously irrelevant FB pages (discover, search, create, etc.)
+      // We mainly want actual group pages like /groups/<id or slug>/
+      const fullUrl = normalizeGroupUrl(href.startsWith("http") ? href : new URL(href, location.origin).href);
+      if (!/\/groups\/[^\/]+\/$/i.test(fullUrl)) continue;
+
+      // Get a name. Often FB has nested spans; innerText of anchor is usually ok.
+      // But some links are icon-only; ignore empty.
+      let name = sanitizeName(a.innerText);
+      if (!name) {
+        // Try aria-label if present
+        name = sanitizeName(a.getAttribute("aria-label") || "");
+      }
+      if (!name) continue;
+
+      results.push({ name, url: fullUrl });
+    }
+
+    // Deduplicate within this scan
+    const seen = new Set();
+    return results.filter((r) => {
+      const k = r.url;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }
+
+  /***********************
+   * UI
+   ***********************/
+  function makeUI() {
+    const box = document.createElement("div");
+    box.id = "devskits-fb-groups-scanner";
+    box.style.cssText = `
+      position: fixed;
+      right: 12px;
+      bottom: 12px;
+      width: 320px;
+      max-width: calc(100vw - 24px);
+      background: rgba(18,18,18,0.92);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 12px;
+      padding: 10px;
+      font: 14px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      z-index: 2147483647;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+      user-select: none;
+    `;
+
+    box.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+        <div style="font-weight:700;">FB Group Scanner</div>
+        <button data-act="min" style="all:unset; cursor:pointer; padding:4px 8px; border-radius:8px; background:rgba(255,255,255,0.10);">–</button>
+      </div>
+      <div data-row="stats" style="margin-top:8px; color:rgba(255,255,255,0.85);">
+        <div>Collected: <b data-k="count">0</b></div>
+        <div>New last scan: <b data-k="new">0</b></div>
+        <div>Status: <b data-k="status">idle</b></div>
       </div>
 
-      <div id="fb-groups-scraper-body">
-        <div class="section buttons">
-          <button id="fb-groups-scraper-scan" type="button">🔍 Scan Visible</button>
-          <button id="fb-groups-scraper-autoscan" type="button">🤖 Auto-Scan (2min)</button>
-          <button id="fb-groups-scraper-export" type="button">📤 Export</button>
-          <button id="fb-groups-scraper-copy" type="button">📋 Copy</button>
-          <button id="fb-groups-scraper-clear" type="button">🗑️ Clear</button>
-        </div>
+      <div data-row="controls" style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button data-act="toggle" style="flex:1; min-width:120px; padding:8px 10px; border-radius:10px; border:0; cursor:pointer; background:#1b74e4; color:white; font-weight:700;">Start</button>
+        <button data-act="export" style="flex:1; min-width:120px; padding:8px 10px; border-radius:10px; border:0; cursor:pointer; background:rgba(255,255,255,0.12); color:white; font-weight:700;">Export CSV</button>
+        <button data-act="copy" style="flex:1; min-width:120px; padding:8px 10px; border-radius:10px; border:0; cursor:pointer; background:rgba(255,255,255,0.12); color:white; font-weight:700;">Copy CSV</button>
+        <button data-act="clear" style="flex:1; min-width:120px; padding:8px 10px; border-radius:10px; border:0; cursor:pointer; background:rgba(255,70,70,0.18); color:white; font-weight:700;">Clear</button>
+      </div>
 
-        <div class="section filters">
-          <label>
-            Min members:
-            <input id="fb-groups-scraper-minmembers" inputmode="numeric" type="number" min="0" step="1" placeholder="0" />
-          </label>
-
-          <label>
-            Active within:
-            <input id="fb-groups-scraper-activity" type="text" placeholder="e.g. 1 day / 1 week" />
-          </label>
-
-          <label>
-            Format:
-            <select id="fb-groups-scraper-format">
-              <option value="csv">CSV</option>
-              <option value="json">JSON</option>
-            </select>
-          </label>
-        </div>
-
-        <div class="section toggles">
-          <label class="toggle">
-            <input id="fb-groups-scraper-showprogress" type="checkbox" />
-            <span>Show progress</span>
-          </label>
-
-          <label class="toggle">
-            <input id="fb-groups-scraper-showlist" type="checkbox" />
-            <span>Show list</span>
-          </label>
-        </div>
-
-        <div class="progress-container">
-          <div class="progress-bar">
-            <div class="fill"></div>
-          </div>
-        </div>
-
-        <div class="list-container">
-          <div class="list" id="fb-groups-scraper-list"></div>
-        </div>
-
-        <div class="status" id="fb-groups-scraper-status">Ready 🚀</div>
+      <div data-row="log" style="margin-top:10px; padding:8px; border-radius:10px; background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.85); max-height:110px; overflow:auto; white-space:pre-wrap;"></div>
+      <div style="margin-top:8px; font-size:12px; color:rgba(255,255,255,0.55);">
+        Tip: leave this page open. It will scroll + collect as FB loads more.
       </div>
     `;
 
-    document.body.appendChild(panel);
-    addStyles();
-    attachEvents(panel);
+    document.body.appendChild(box);
 
-    // Apply saved UI state
-    panel.classList.toggle('minimized', !!state.panelMinimized);
-    updateTheme();
-    syncUIFromSettings();
-    updateCount();
-    updateProgress();
-    updateList();
-  }
-
-  function addStyles() {
-    GM_addStyle(`
-      #fb-groups-scraper-panel {
-        position: fixed;
-        z-index: 999999;
-        right: 12px;
-        bottom: 12px;
-        width: min(380px, 92vw);
-        max-height: 80vh;
-        background: var(--bg);
-        color: var(--text);
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        font-size: 14px;
-        border-radius: 16px;
-        box-shadow: 0 8px 30px rgba(0,0,0,0.35);
-        padding: 0;
-        overflow: hidden;
-        transition: transform 0.15s ease, opacity 0.15s ease;
-        resize: both;
-        min-width: 280px;
-        min-height: 140px;
-        touch-action: none;
-      }
-
-      #fb-groups-scraper-panel.minimized {
-        height: 44px !important;
-        resize: none !important;
-      }
-      #fb-groups-scraper-panel.minimized #fb-groups-scraper-body {
-        display: none;
-      }
-
-      #fb-groups-scraper-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 10px 14px;
-        background: var(--header-bg);
-        cursor: move;
-        user-select: none;
-        border-bottom: 1px solid var(--border);
-      }
-
-      #fb-groups-scraper-header .title {
-        font-weight: 650;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        min-width: 0;
-      }
-
-      #fb-groups-scraper-header .title span:nth-child(2) {
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 180px;
-      }
-
-      #fb-groups-scraper-header .pill {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 2px 8px;
-        border-radius: 999px;
-        border: 1px solid var(--border);
-        background: var(--bg-secondary);
-        color: var(--text);
-        font-variant-numeric: tabular-nums;
-      }
-
-      #fb-groups-scraper-header .controls button {
-        background: none;
-        border: none;
-        color: var(--text-muted);
-        font-size: 18px;
-        cursor: pointer;
-        padding: 6px;
-        margin-left: 6px;
-        border-radius: 10px;
-        transition: background 0.15s, color 0.15s;
-      }
-      #fb-groups-scraper-header .controls button:hover {
-        color: var(--text);
-        background: var(--btn-hover);
-      }
-
-      #fb-groups-scraper-body {
-        padding: 14px;
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        overflow: auto;
-        max-height: calc(80vh - 44px);
-        -webkit-overflow-scrolling: touch;
-        touch-action: pan-y;
-      }
-
-      .section.buttons {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 8px;
-      }
-
-      .section.buttons button,
-      .section.filters select,
-      .section.filters input {
-        padding: 10px 10px;
-        border-radius: 10px;
-        border: 1px solid var(--border);
-        background: var(--btn-bg);
-        color: var(--text);
-        cursor: pointer;
-        font-size: 13px;
-        transition: background 0.15s, border 0.15s;
-      }
-      .section.buttons button:hover {
-        background: var(--btn-hover);
-        border-color: var(--border-hover);
-      }
-
-      .section.filters {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-      }
-      .section.filters label {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-      .section.filters input,
-      .section.filters select {
-        flex: 1;
-        min-width: 0;
-      }
-
-      .section.toggles {
-        display: flex;
-        gap: 16px;
-        flex-wrap: wrap;
-      }
-      .toggle {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        color: var(--text-muted);
-        user-select: none;
-      }
-      .toggle input {
-        width: 18px;
-        height: 18px;
-        accent-color: var(--progress-fill);
-      }
-
-      .progress-container { display: flex; flex-direction: column; gap: 6px; }
-      .progress-bar {
-        height: 8px;
-        background: var(--progress-bg);
-        border-radius: 999px;
-        overflow: hidden;
-        opacity: 0;
-        transition: opacity 0.2s;
-      }
-      .progress-bar.visible { opacity: 1; }
-      .progress-bar .fill {
-        height: 100%;
-        background: var(--progress-fill);
-        width: 0%;
-        transition: width 0.25s ease-out;
-      }
-
-      .list-container { display: none; flex-direction: column; gap: 6px; }
-      .list-container.visible { display: flex; }
-      .list {
-        overflow: auto;
-        max-height: 260px;
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 6px;
-        background: var(--bg-secondary);
-        -webkit-overflow-scrolling: touch;
-      }
-      .group-item {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        padding: 10px;
-        border-radius: 10px;
-      }
-      .group-item + .group-item { border-top: 1px solid var(--border); border-top-left-radius: 0; border-top-right-radius: 0; }
-      .group-item a { color: var(--link); text-decoration: none; font-weight: 600; }
-      .group-item a:hover { text-decoration: underline; }
-      .group-item span { font-size: 12px; color: var(--text-muted); }
-
-      .status {
-        font-size: 13px;
-        color: var(--text-muted);
-        min-height: 18px;
-        text-align: center;
-        padding-top: 2px;
-      }
-
-      /* Themes */
-      #fb-groups-scraper-panel.dark {
-        --bg: #1e1e1e;
-        --bg-secondary: #252525;
-        --header-bg: #181818;
-        --text: #e7e7e7;
-        --text-muted: #a7a7a7;
-        --border: #343434;
-        --border-hover: #4a4a4a;
-        --btn-bg: #2a2a2a;
-        --btn-hover: #343434;
-        --progress-bg: #343434;
-        --progress-fill: #4caf50;
-        --link: #4da6ff;
-      }
-      #fb-groups-scraper-panel.light {
-        --bg: #ffffff;
-        --bg-secondary: #f6f6f6;
-        --header-bg: #f1f1f1;
-        --text: #121212;
-        --text-muted: #666666;
-        --border: #dddddd;
-        --border-hover: #cfcfcf;
-        --btn-bg: #f0f0f0;
-        --btn-hover: #e7e7e7;
-        --progress-bg: #e0e0e0;
-        --progress-fill: #2e7d32;
-        --link: #0066cc;
-      }
-    `);
-  }
-
-  function updateTheme() {
-    const panel = document.getElementById('fb-groups-scraper-panel');
-    if (!panel) return;
-    panel.classList.toggle('dark', state.theme === 'dark');
-    panel.classList.toggle('light', state.theme === 'light');
-    const themeBtn = document.getElementById('fb-groups-scraper-theme');
-    if (themeBtn) themeBtn.textContent = state.theme === 'dark' ? '🌙' : '☀️';
-  }
-
-  function syncUIFromSettings() {
-    const fmt = document.getElementById('fb-groups-scraper-format');
-    const mm = document.getElementById('fb-groups-scraper-minmembers');
-    const act = document.getElementById('fb-groups-scraper-activity');
-    const sp = document.getElementById('fb-groups-scraper-showprogress');
-    const sl = document.getElementById('fb-groups-scraper-showlist');
-
-    if (fmt) fmt.value = state.settings.exportFormat;
-    if (mm) mm.value = String(state.settings.minMembers || 0);
-    if (act) act.value = state.settings.activityThreshold || '';
-    if (sp) sp.checked = !!state.settings.showProgress;
-    if (sl) sl.checked = !!state.settings.showList;
-
-    const pb = document.querySelector('.progress-bar');
-    if (pb) pb.classList.toggle('visible', !!state.settings.showProgress);
-
-    const lc = document.querySelector('.list-container');
-    if (lc) lc.classList.toggle('visible', !!state.settings.showList);
-  }
-
-  // --------- Event Attachment ---------
-  function attachEvents(panel) {
-    // Drag header (fixed for mobile)
-    const header = panel.querySelector('#fb-groups-scraper-header');
+    // drag
     let dragging = false, startX = 0, startY = 0, startRight = 0, startBottom = 0;
+    const header = box.firstElementChild;
+    header.style.cursor = "grab";
 
-    header.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('button')) return;
+    header.addEventListener("pointerdown", (e) => {
       dragging = true;
+      header.setPointerCapture(e.pointerId);
       startX = e.clientX;
       startY = e.clientY;
-      const rect = panel.getBoundingClientRect();
-      startRight = window.innerWidth - rect.right;
-      startBottom = window.innerHeight - rect.bottom;
-      try { header.setPointerCapture(e.pointerId); } catch {}
-      e.preventDefault();
+      startRight = parseFloat(box.style.right) || 12;
+      startBottom = parseFloat(box.style.bottom) || 12;
+      header.style.cursor = "grabbing";
     });
 
-    document.addEventListener('pointermove', (e) => {
+    header.addEventListener("pointermove", (e) => {
       if (!dragging) return;
-      panel.style.right = Math.max(0, startRight - (e.clientX - startX)) + 'px';
-      panel.style.bottom = Math.max(0, startBottom - (e.clientY - startY)) + 'px';
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      box.style.right = Math.max(6, startRight - dx) + "px";
+      box.style.bottom = Math.max(6, startBottom - dy) + "px";
     });
 
-    document.addEventListener('pointerup', () => { dragging = false; });
-
-    // Buttons
-    const scanBtn = panel.querySelector('#fb-groups-scraper-scan');
-    scanBtn.onclick = () => {
-      const added = scanPage();
-      setStatus(`Scan done: +${added} new groups (${state.items.size} total)`);
-    };
-
-    const autoscanBtn = panel.querySelector('#fb-groups-scraper-autoscan');
-    autoscanBtn.onclick = () => {
-      if (state.autoscanTimer) {
-        clearInterval(state.autoscanTimer);
-        state.autoscanTimer = null;
-        state.isScanning = false;
-        autoscanBtn.textContent = '🤖 Auto-Scan (2min)';
-        setStatus('Auto-scan stopped');
-        return;
-      }
-      state.autoscanEndAt = Date.now() + 120000;
-      state.isScanning = true;
-      setStatus('🤖 Auto-scan started (2min)...');
-      autoscanBtn.textContent = '🛑 Stop Auto-Scan';
-      state.autoscanTimer = setInterval(() => {
-        window.scrollBy(0, window.innerHeight);
-        const added = scanPage();
-        if (added > 0) setStatus(`Auto-scan: +${added} (${state.items.size} total)`);
-        if (Date.now() > state.autoscanEndAt || state.items.size >= state.settings.maxItems) {
-          clearInterval(state.autoscanTimer);
-          state.autoscanTimer = null;
-          state.isScanning = false;
-          autoscanBtn.textContent = '🤖 Auto-Scan (2min)';
-          setStatus(`Auto-scan finished: ${state.items.size} groups`);
-        }
-      }, 2000);
-    };
-
-    panel.querySelector('#fb-groups-scraper-export').onclick = () => {
-      const data = exportData(state.settings.exportFormat);
-      downloadData(data, state.settings.exportFormat);
-      setStatus(`Exported ${state.items.size} groups`);
-    };
-
-    panel.querySelector('#fb-groups-scraper-copy').onclick = async () => {
-      const data = exportData(state.settings.exportFormat);
-      try {
-        await navigator.clipboard.writeText(data);
-        setStatus('Copied to clipboard!');
-      } catch {
-        if (typeof GM_setClipboard === 'function') GM_setClipboard(data);
-        setStatus('Copied via GM!');
-      }
-    };
-
-    panel.querySelector('#fb-groups-scraper-clear').onclick = () => {
-      if (confirm('Clear all collected groups?')) {
-        state.items.clear();
-        updateCount();
-        updateProgress();
-        updateList();
-        setStatus('Data cleared');
-      }
-    };
-
-    panel.querySelector('#fb-groups-scraper-theme').onclick = () => {
-      state.theme = state.theme === 'dark' ? 'light' : 'dark';
-      updateTheme();
-    };
-
-    panel.querySelector('#fb-groups-scraper-minimize').onclick = () => {
-      state.panelMinimized = !state.panelMinimized;
-      panel.classList.toggle('minimized', state.panelMinimized);
-    };
-
-    panel.querySelector('#fb-groups-scraper-close').onclick = () => panel.remove();
-
-    // Settings bindings
-    panel.querySelector('#fb-groups-scraper-format').onchange = (e) => {
-      state.settings.exportFormat = e.target.value;
-      saveSettings();
-    };
-
-    panel.querySelector('#fb-groups-scraper-minmembers').onchange = (e) => {
-      state.settings.minMembers = parseInt(e.target.value, 10) || 0;
-      saveSettings();
-    };
-
-    panel.querySelector('#fb-groups-scraper-activity').onchange = (e) => {
-      state.settings.activityThreshold = (e.target.value || '').trim();
-      saveSettings();
-    };
-
-    panel.querySelector('#fb-groups-scraper-showprogress').onchange = (e) => {
-      state.settings.showProgress = e.target.checked;
-      const pb = document.querySelector('.progress-bar');
-      if (pb) pb.classList.toggle('visible', e.target.checked);
-      saveSettings();
-    };
-
-    panel.querySelector('#fb-groups-scraper-showlist').onchange = (e) => {
-      state.settings.showList = e.target.checked;
-      const lc = document.querySelector('.list-container');
-      if (lc) lc.classList.toggle('visible', e.target.checked);
-      saveSettings();
-      updateList();
-    };
-
-    // Keyboard shortcuts
-    document.addEventListener('keydown', (e) => {
-      if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
-      if (e.ctrlKey || e.metaKey) {
-        switch (e.key.toLowerCase()) {
-          case 's': e.preventDefault(); scanBtn.click(); break;
-          case 'a': e.preventDefault(); autoscanBtn.click(); break;
-          case 'e': e.preventDefault(); panel.querySelector('#fb-groups-scraper-export').click(); break;
-        }
-      }
+    header.addEventListener("pointerup", (e) => {
+      dragging = false;
+      header.releasePointerCapture(e.pointerId);
+      header.style.cursor = "grab";
     });
+
+    return box;
   }
 
-  function setStatus(msg) {
-    const el = document.getElementById('fb-groups-scraper-status');
-    if (el) el.textContent = msg;
+  function uiSet(box, key, val) {
+    const el = box.querySelector(`[data-k="${key}"]`);
+    if (el) el.textContent = String(val);
   }
 
-  function updateCount() {
-    const el = document.getElementById('fb-groups-scraper-count');
-    if (el) el.textContent = state.items.size.toLocaleString();
+  function uiLog(box, msg) {
+    const log = box.querySelector('[data-row="log"]');
+    if (!log) return;
+    const t = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+    log.textContent = (t + log.textContent).slice(0, 4000);
   }
 
-  function updateProgress() {
-    const pct = Math.min(100, (state.items.size / state.settings.maxItems) * 100);
-    const fill = document.querySelector('.progress-bar .fill');
-    if (fill) fill.style.width = pct + '%';
-    if (state.items.size >= state.settings.maxItems) setStatus(`Max limit (${state.settings.maxItems}) reached!`);
+  /***********************
+   * MAIN LOOP
+   ***********************/
+  let running = false;
+  let scanTimer = null;
+  let scrollTimer = null;
+
+  const store = loadStore();
+
+  function getRows() {
+    return store.order.map((url) => store.byUrl[url]).filter(Boolean);
   }
 
-  function updateList() {
-    const listEl = document.getElementById('fb-groups-scraper-list');
-    const container = document.querySelector('.list-container');
-    if (!listEl || !container) return;
-
-    if (!state.settings.showList) {
-      listEl.innerHTML = '';
-      return;
+  function addGroup(name, url) {
+    const key = url;
+    if (store.byUrl[key]) {
+      // update name if it improved
+      if (name && name.length > store.byUrl[key].name.length) store.byUrl[key].name = name;
+      return false;
     }
-
-    listEl.innerHTML = '';
-    const sorted = Array.from(state.items.values()).sort((a, b) => b.membersNum - a.membersNum);
-
-    for (const rec of sorted) {
-      const item = document.createElement('div');
-      item.className = 'group-item';
-      item.innerHTML = `
-        <a href="${escapeHtml(rec.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(rec.name)}</a>
-        <span>${escapeHtml(rec.members || 'N/A')} members • ${escapeHtml(rec.lastActive || 'N/A')}</span>
-      `;
-      listEl.appendChild(item);
-    }
+    store.byUrl[key] = { name, url, firstSeen: nowIso() };
+    store.order.push(key);
+    return true;
   }
 
-  function escapeHtml(s) {
-    return String(s ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
-
-  // --------- Time Parsing ---------
-  function parseTimeAgo(str) {
-    if (!str) return Infinity;
-    const m = str.match(/(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago?/i);
-    if (!m) return Infinity;
-    const num = parseInt(m[1], 10);
-    const unit = m[2].toLowerCase();
-    switch (unit) {
-      case 'second': return num;
-      case 'minute': return num * 60;
-      case 'hour': return num * 3600;
-      case 'day': return num * 86400;
-      case 'week': return num * 604800;
-      case 'month': return num * 2592000;
-      case 'year': return num * 31536000;
-      default: return Infinity;
-    }
-  }
-
-  function isRecentEnough(lastActive, threshold) {
-    if (!threshold) return true;
-    const threshSeconds = parseTimeAgo((threshold || '').trim() + ' ago');
-    const activeSeconds = parseTimeAgo((lastActive || '').trim() + ' ago');
-    return activeSeconds <= threshSeconds;
-  }
-
-  // --------- Robust Scanning (2025 compatible) ---------
-  function scanPage() {
+  function scanOnce(ui) {
+    const candidates = extractGroupCandidates();
     let added = 0;
-    const linkSelectors = [
-      'a[href*="/groups/"]:not([href*="feed"]):not([href*="joins"]):not([href*="discover"]):not([href*="create"]):not([href*="requests"])',
-      'a[role="link"][href*="/groups/"]'
-    ];
 
-    const anchors = new Set();
-    linkSelectors.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((a) => anchors.add(a));
-    });
-
-    for (const a of anchors) {
-      const href = a.getAttribute('href');
-      if (!href) continue;
-
-      const abs = absolutize(href);
-      if (!abs) continue;
-
-      const canonical = canonicalizeGroupUrl(abs);
-      if (!canonical) continue;
-
-      const key = groupKey(canonical);
-      if (state.items.has(key)) continue;
-
-      const container =
-        a.closest('div[role="article"], div[data-pagelet], div.x1lliihq, div.x1y1aw1k, div.x78zum5, div.x1n2onr6') ||
-        a.closest('div') ||
-        a.parentElement;
-      if (!container) continue;
-
-      const textBlock = container.innerText || '';
-
-      let name =
-        a.querySelector('span[dir="auto"]')?.innerText?.trim() ||
-        cleanText(a.innerText) ||
-        findBestName(container);
-
-      if (!name || name.length < 3) continue;
-
-      const membersStr = findMembers(textBlock);
-      const membersNum = parseMembers(membersStr);
-
-      if (membersNum < state.settings.minMembers) continue;
-
-      const lastActive = findLastActive(textBlock);
-      if (!isRecentEnough(lastActive, state.settings.activityThreshold)) continue;
-
-      const record = {
-        name,
-        members: membersStr || '',
-        membersNum,
-        lastActive: lastActive || '',
-        url: canonical,
-        timestamp: new Date().toISOString()
-      };
-
-      state.items.set(key, record);
-      added++;
+    for (const c of candidates) {
+      if (!c.url || !c.name) continue;
+      if (addGroup(c.name, c.url)) added++;
     }
 
     if (added > 0) {
-      updateCount();
-      updateProgress();
-      updateList();
+      saveStore(store);
+      uiLog(ui, `Added ${added} new group(s). Total now ${store.order.length}.`);
     }
+
+    uiSet(ui, "count", store.order.length);
+    uiSet(ui, "new", added);
     return added;
   }
 
-  function parseMembers(str) {
-    if (!str) return 0;
-    const m = str.match(/([\d,.]+)([KkMm]?)/);
-    if (!m) return 0;
-    let num = parseFloat(m[1].replace(/,/g, ''));
-    const suffix = (m[2] || '').toLowerCase();
-    if (suffix === 'k') num *= 1000;
-    if (suffix === 'm') num *= 1000000;
-    return num;
-  }
+  async function start(ui) {
+    if (running) return;
+    running = true;
+    uiSet(ui, "status", "running");
 
-  function findBestName(container) {
-    const candidates = container.querySelectorAll('span, div, strong, h3');
-    let best = '';
-    for (const el of candidates) {
-      const t = cleanText(el.innerText);
-      if (t.length > best.length && t.length < 150 && !/(members|posts|active|joined)/i.test(t)) {
-        best = t;
+    // Initial scan
+    scanOnce(ui);
+
+    scanTimer = setInterval(() => {
+      try { scanOnce(ui); } catch (e) { uiLog(ui, `Scan error: ${e?.message || e}`); }
+    }, SCAN_INTERVAL_MS);
+
+    scrollTimer = setInterval(() => {
+      try {
+        // Scroll down to force load more groups
+        window.scrollBy(0, SCROLL_STEP);
+      } catch (e) {
+        uiLog(ui, `Scroll error: ${e?.message || e}`);
       }
-    }
-    return best;
+    }, SCROLL_INTERVAL_MS);
+
+    uiLog(ui, "Started scanning + scrolling.");
   }
 
-  // Helpers
-  function absolutize(u) {
-    try { return new URL(u, location.href).href; } catch { return null; }
+  function stop(ui) {
+    running = false;
+    uiSet(ui, "status", "stopped");
+    if (scanTimer) clearInterval(scanTimer);
+    if (scrollTimer) clearInterval(scrollTimer);
+    scanTimer = null;
+    scrollTimer = null;
+    uiLog(ui, "Stopped.");
   }
 
-  function canonicalizeGroupUrl(u) {
-    try {
-      const url = new URL(u);
-      if (!url.hostname.endsWith('facebook.com')) return null;
-      const match = url.pathname.match(/\/groups\/([^/?]+)/);
-      return match ? `${url.origin}/groups/${match[1]}` : null;
-    } catch { return null; }
+  function clearData(ui) {
+    store.byUrl = {};
+    store.order = [];
+    saveStore(store);
+    uiSet(ui, "count", 0);
+    uiSet(ui, "new", 0);
+    uiLog(ui, "Cleared saved data.");
   }
 
-  function groupKey(url) {
-    return url.split('/groups/')[1];
+  function exportCsv(ui) {
+    const rows = getRows();
+    const csv = toCsv(rows);
+    const filename = `fb_groups_${new Date().toISOString().slice(0,10)}.csv`;
+    downloadText(filename, csv);
+    uiLog(ui, `Exported CSV (${rows.length} rows).`);
   }
 
-  function cleanText(s) {
-    return (s || '').replace(/\s+/g, ' ').trim();
+  async function copyCsv(ui) {
+    const rows = getRows();
+    const csv = toCsv(rows);
+    const ok = await copyToClipboard(csv);
+    uiLog(ui, ok ? `Copied CSV to clipboard (${rows.length} rows).` : "Clipboard copy failed (thanks, iOS). Try Export CSV.");
   }
 
-  function findMembers(text) {
-    const regex = /([\d,.]+[KkMm]?)\s*members?/i;
-    const m = (text || '').match(regex);
-    return m ? m[1].trim() : null;
-  }
-
-  function findLastActive(text) {
-    const patterns = [
-      /active\s*([\d\w\s]+?)\s*ago/i,
-      /last\s*active\s*([\d\w\s]+?)\s*ago/i,
-      /([\d\w\s]+?)\s*(hour|day|week|month|year)s?\s*ago/i
-    ];
-    for (const pat of patterns) {
-      const m = (text || '').match(pat);
-      if (m) return cleanText(m[1] || m[0]);
-    }
-    return null;
-  }
-
-  // --------- Export ---------
-  function exportData(format) {
-    const sorted = Array.from(state.items.values()).sort((a, b) => b.membersNum - a.membersNum);
-
-    const rows = [['Group Name', 'Members', 'Last Active', 'URL', 'Scanned At']];
-    for (const rec of sorted) {
-      rows.push([rec.name, rec.members, rec.lastActive, rec.url, new Date(rec.timestamp).toLocaleString()]);
-    }
-
-    if (format === 'csv') {
-      const esc = (v) => `"${String(v || '').replace(/"/g, '""')}"`;
-      return '\uFEFF' + rows.map((r) => r.map(esc).join(',')).join('\n');
-    }
-
-    return JSON.stringify(
-      { exportedAt: new Date().toISOString(), total: sorted.length, groups: sorted },
-      null,
-      2
-    );
-  }
-
-  function downloadData(data, format) {
-    const blob = new Blob([data], { type: format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `fb-groups-${format}-${new Date().toISOString().slice(0, 10)}.${format}`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  // --------- Init ---------
+  /***********************
+   * INIT
+   ***********************/
   function init() {
-    if (document.getElementById('fb-groups-scraper-panel')) return;
-    loadSettings();
-    createPanel();
-    setStatus('Initialized! Scan or Auto-Scan. Shortcuts: Ctrl+S/A/E');
-    if (state.settings.autoStart) {
-      document.querySelector('#fb-groups-scraper-autoscan')?.click();
-    }
+    const ui = makeUI();
+    uiSet(ui, "count", store.order.length);
+    uiSet(ui, "new", 0);
+    uiSet(ui, "status", "idle");
+    uiLog(ui, "Loaded. Ready.");
+
+    const btnToggle = ui.querySelector('[data-act="toggle"]');
+    const btnExport = ui.querySelector('[data-act="export"]');
+    const btnCopy = ui.querySelector('[data-act="copy"]');
+    const btnClear = ui.querySelector('[data-act="clear"]');
+    const btnMin = ui.querySelector('[data-act="min"]');
+
+    btnToggle.addEventListener("click", async () => {
+      if (!running) {
+        btnToggle.textContent = "Stop";
+        btnToggle.style.background = "rgba(255,255,255,0.12)";
+        btnToggle.style.color = "#fff";
+        await start(ui);
+      } else {
+        btnToggle.textContent = "Start";
+        btnToggle.style.background = "#1b74e4";
+        btnToggle.style.color = "#fff";
+        stop(ui);
+      }
+    });
+
+    btnExport.addEventListener("click", () => exportCsv(ui));
+    btnCopy.addEventListener("click", () => copyCsv(ui));
+
+    btnClear.addEventListener("click", () => {
+      stop(ui);
+      btnToggle.textContent = "Start";
+      btnToggle.style.background = "#1b74e4";
+      btnToggle.style.color = "#fff";
+      clearData(ui);
+    });
+
+    let minimized = false;
+    btnMin.addEventListener("click", () => {
+      minimized = !minimized;
+      const rows = ["stats", "controls", "log"];
+      for (const r of rows) {
+        const el = ui.querySelector(`[data-row="${r}"]`);
+        if (el) el.style.display = minimized ? "none" : "";
+      }
+      btnMin.textContent = minimized ? "+" : "–";
+    });
+
+    // Safety: if FB navigates within SPA, keep scanning
+    uiLog(ui, "Note: FB is an SPA. If you navigate away, reload this page to keep scanning.");
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
+  // FB can take time to render; give it a moment
+  (async () => {
+    await sleep(1200);
     init();
-  }
+  })();
 })();
