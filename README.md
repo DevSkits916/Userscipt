@@ -1,5 +1,4 @@
 IOS 26.2 friendly (user userscipts or stay from app store)
-https://github.com/DevSkits916/Userscipt/blob/main/Exported%20csv.png
 
 # Facebook Groups Scraper Userscript
 (Violates Facebook TOS but works and they cant tell)
