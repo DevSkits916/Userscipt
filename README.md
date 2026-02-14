@@ -1,4 +1,4 @@
-IOS 26.2 friendly (user userscipts or stay from app store)
+IOS 26.2 friendly (userscipts or stay extenstion for safari from app store)
 
 # Facebook Groups Scraper Userscript
 (Violates Facebook TOS but works and they cant tell)
